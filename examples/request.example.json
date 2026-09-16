@@ -1,0 +1,7 @@
+{
+  "audio": "./reference.wav",
+  "reference_text": "A short reference transcript containing a laugh.",
+  "text": "Text to synthesize while preserving detected non-verbal sounds.",
+  "language": "English",
+  "sed": {"threshold": 0.2, "min_nv_duration": 0.1, "event_labels": ["Laughter", "Sigh", "Gasp"]}
+}

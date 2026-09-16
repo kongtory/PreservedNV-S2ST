@@ -1,0 +1,47 @@
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Runtime outputs, logs, and local experiment state
+outputs/
+audit.json
+*.log
+wandb/
+runs/
+checkpoints/
+
+# Audio/data that must not be redistributed without explicit permission
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+data/
+datasets/
+
+# Model weights and downloaded artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+
+# Externally cloned dependencies; install them outside this repository.
+OmniVoice/
+PretrainedSED/
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/

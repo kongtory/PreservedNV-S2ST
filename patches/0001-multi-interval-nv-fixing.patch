@@ -1,0 +1,484 @@
+diff --git a/omnivoice/models/omnivoice.py b/omnivoice/models/omnivoice.py
+index 96673eb84cbe084cbb8eb3127b34d721365c1584..c2ad6478466559138f3115849d503be125d5ad28 100644
+--- a/omnivoice/models/omnivoice.py
++++ b/omnivoice/models/omnivoice.py
+@@ -86,12 +86,14 @@ logger = logging.getLogger(__name__)
+ # Dataclasses
+ # ---------------------------------------------------------------------------
+ 
+-
+ @dataclass
+-class VoiceClonePrompt:
++class NVVoiceClonePrompt:
+     ref_audio_tokens: torch.Tensor  # (C, T)
+     ref_text: str
+-    ref_rms: float
++    nv_audio_tokens: Optional[List[torch.Tensor]]
++    nv_lens: Optional[List[int]]
++    nv_positions: Optional[torch.Tensor]
++    ref_rms: Optional[float]
+ 
+ 
+ @dataclass
+@@ -124,6 +126,9 @@ class GenerationTask:
+     instructs: List[Optional[str]]
+     ref_texts: List[Optional[str]]
+     ref_audio_tokens: List[Optional[torch.Tensor]]
++    nv_audio_tokens: List[Optional[torch.Tensor]]
++    nv_positions: List[Optional[torch.Tensor]]
++    nv_lens: List[Optional[int]]
+     ref_rms: List[Optional[float]]
+     speed: Optional[List[float]] = None
+ 
+@@ -144,6 +149,9 @@ class GenerationTask:
+             instructs=[self.instructs[i] for i in indices],
+             ref_texts=[self.ref_texts[i] for i in indices],
+             ref_audio_tokens=[self.ref_audio_tokens[i] for i in indices],
++            nv_audio_tokens=[self.nv_audio_tokens[i] for i in indices],
++            nv_positions=[self.nv_positions[i] for i in indices],
++            nv_lens=[self.nv_lens[i] for i in indices],
+             ref_rms=[self.ref_rms[i] for i in indices],
+             speed=[self.speed[i] for i in indices] if self.speed else None,
+         )
+@@ -485,9 +493,10 @@ class OmniVoice(PreTrainedModel):
+             list[tuple[torch.Tensor, int]],
+             None,
+         ] = None,
+-        voice_clone_prompt: Union[
+-            VoiceClonePrompt, list[VoiceClonePrompt], None
+-        ] = None,
++        nv_position: Union[tuple, list[tuple], None] = None,
++        nv_voice_clone_prompt: Union[
++                    NVVoiceClonePrompt, list[NVVoiceClonePrompt], None
++                ] = None,
+         instruct: Union[str, list[str], None] = None,
+         duration: Union[float, list[Optional[float]], None] = None,
+         speed: Union[float, list[Optional[float]], None] = None,
+@@ -499,8 +508,8 @@ class OmniVoice(PreTrainedModel):
+         Supports three modes:
+ 
+         1. **Voice clone** — clone the voice style from the reference audio.
+-            Should provide ``voice_clone_prompt`` (from
+-           :meth:`create_voice_clone_prompt`) or ``ref_text`` + ``ref_audio``.
++            Should provide ``nv_voice_clone_prompt`` (from
++           :meth:`create_nv_voice_clone_prompt`) or ``ref_text`` + ``ref_audio``.
+         2. **Voice design** — provide ``instruct`` text describing
+            the desired voice style; no reference audio needed.
+         3. **Auto** — provide neither; the model picks a voice itself.
+@@ -513,7 +522,7 @@ class OmniVoice(PreTrainedModel):
+             ref_text: Optional reference text for voice cloning mode.
+             ref_audio: Optional reference audio for voice cloning mode.
+                 Can be a file path or a (waveform, sample_rate) tuple.
+-            voice_clone_prompt: Reusable prompt from :meth:`create_voice_clone_prompt`.
++            nv_voice_clone_prompt: Reusable prompt from :meth:`create_nv_voice_clone_prompt`.
+                 If provided, it overrides ``ref_text`` and ``ref_audio``.
+             instruct: Style instruction for voice design mode.
+             duration: Fixed output duration in seconds. If a single float,
+@@ -564,7 +573,8 @@ class OmniVoice(PreTrainedModel):
+             language=language,
+             ref_text=ref_text,
+             ref_audio=ref_audio,
+-            voice_clone_prompt=voice_clone_prompt,
++            nv_position=nv_position,
++            nv_voice_clone_prompt=nv_voice_clone_prompt,
+             instruct=instruct,
+             preprocess_prompt=gen_config.preprocess_prompt,
+             speed=speed,
+@@ -600,27 +610,14 @@ class OmniVoice(PreTrainedModel):
+ 
+         return generated_audios
+ 
+-    def create_voice_clone_prompt(
++    def create_nv_voice_clone_prompt(
+         self,
+         ref_audio: Union[str, tuple[torch.Tensor, int]],
+         ref_text: Optional[str] = None,
++        nv_position: Union[tuple, list[tuple], None] = None,
+         preprocess_prompt: bool = True,
+-    ) -> VoiceClonePrompt:
+-        """Create a reusable voice clone prompt from reference audio.
+-
+-        Args:
+-            ref_audio: File path (str) or ``(waveform, sample_rate)`` tuple.
+-                waveform should be a 1-D or 2-D torch.Tensor (channels x samples).
+-            ref_text: Transcript of the reference audio. If ``None``, the
+-                ASR model will be used to auto-transcribe (must call
+-                :meth:`load_asr_model` first).
+-            preprocess_prompt: If ``True`` (default), apply silence removal and
+-                trimming to the reference audio, add punctuation in the end
+-                of reference text (if not already)
++    ) -> NVVoiceClonePrompt:
+ 
+-        Returns:
+-            A :class:`VoiceClonePrompt` that can be passed to :meth:`generate`.
+-        """
+         if self.audio_tokenizer is None:
+             raise RuntimeError(
+                 "Audio tokenizer is not loaded. Make sure you loaded the model "
+@@ -644,69 +641,74 @@ class OmniVoice(PreTrainedModel):
+                     new_freq=self.sampling_rate,
+                 ).numpy()
+             ref_wav = waveform
++        
++        chunk_size = self.audio_tokenizer.config.hop_length
++        clip_size = int(ref_wav.shape[-1] % chunk_size)
+ 
+-        ref_rms = float(np.sqrt(np.mean(ref_wav**2)))
+-        if 0 < ref_rms < 0.1:
+-            ref_wav = ref_wav * 0.1 / ref_rms
+-
+-        if preprocess_prompt:
+-            # Trim long reference audio (>20s) by splitting at the largest silence gap.
+-            # Skip trimming when ref_text is user-provided, otherwise the
+-            # trimmed audio will no longer match the full transcript.
+-            if ref_text is None:
+-                ref_wav = trim_long_audio(
+-                    ref_wav, self.sampling_rate, trim_threshold=20.0
+-                )
+-            ref_wav = remove_silence(
+-                ref_wav,
+-                self.sampling_rate,
+-                mid_sil=200,
+-                lead_sil=100,
+-                trail_sil=200,
+-            )
+-            if ref_wav.shape[-1] == 0:
+-                raise ValueError(
+-                    "Reference audio is empty after silence removal. "
+-                    "Try setting preprocess_prompt=False."
++        if nv_position is None:
++            positions = []
++        elif len(nv_position) == 2 and isinstance(nv_position[0], (int, float)):
++            positions = [nv_position]
++        else:
++            positions = list(nv_position)
++        # Different AudioSet classes often activate over the same sound. Merge
++        # overlapping intervals before token extraction: the model can fix the
++        # union once, whereas two overlapping token tensors are ambiguous.
++        merged_positions = []
++        for start_seconds, end_seconds in sorted(positions):
++            if not 0 <= start_seconds < end_seconds:
++                raise ValueError(f"Invalid NV interval: {(start_seconds, end_seconds)}")
++            if merged_positions and start_seconds <= merged_positions[-1][1]:
++                merged_positions[-1] = (merged_positions[-1][0], max(end_seconds, merged_positions[-1][1]))
++            else:
++                merged_positions.append((start_seconds, end_seconds))
++        positions = merged_positions
++        nv_audio_tokens, nv_lens, frame_positions = [], [], []
++        for start_seconds, end_seconds in positions:
++            start_pos = int(start_seconds * self.sampling_rate)
++            end_pos = min(int(end_seconds * self.sampling_rate), ref_wav.shape[-1])
++            nv_wav = ref_wav[:, start_pos:end_pos]
++            # Align each retained NV clip independently.
++            if nv_wav.shape[-1] < chunk_size:
++                logger.warning(
++                    "Skipping NV interval %.3fs–%.3fs: %d samples after clipping",
++                    start_seconds, end_seconds, nv_wav.shape[-1],
+                 )
+-
+-        ref_duration = ref_wav.shape[-1] / self.sampling_rate
+-        if ref_duration > 20.0:
+-            logger.warning(
+-                "Reference audio is %.1fs long (>20s). This may cause slower "
+-                "generation, higher memory usage, and degraded voice cloning "
+-                "quality. We recommend trimming it to 3-10s.",
+-                ref_duration,
+-            )
+-
+-        # Auto-transcribe if ref_text not provided
++                continue
++            else:
++                nv_clip_size = nv_wav.shape[-1] % chunk_size
++                if nv_clip_size:
++                    nv_wav = nv_wav[:, :-nv_clip_size]
++            tokens = self.audio_tokenizer.encode(
++                torch.from_numpy(nv_wav).float().to(self.audio_tokenizer.device).unsqueeze(0)
++            ).audio_codes.squeeze(0)
++            nv_audio_tokens.append(tokens)
++            nv_lens.append(tokens.size(-1))
++            start = int(start_seconds * self.audio_tokenizer.config.frame_rate)
++            frame_positions.append((start, start + tokens.size(-1)))
++        
++        ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
++        ref_wav_tensor = torch.from_numpy(ref_wav).float().to(self.audio_tokenizer.device)
++        ref_audio_tokens = self.audio_tokenizer.encode(
++            ref_wav_tensor.unsqueeze(0),
++        ).audio_codes.squeeze(0)  # (C, T)
++        
+         if ref_text is None:
+             if self._asr_pipe is None:
+-                logger.info("ASR model not loaded yet, loading on-the-fly ...")
+                 self.load_asr_model()
+             ref_text = self.transcribe((ref_wav, self.sampling_rate))
+-            logger.debug("Auto-transcribed ref_text: %s", ref_text)
++        
++        nv_positions = torch.tensor(frame_positions, dtype=torch.long) if frame_positions else None
+ 
+-        chunk_size = self.audio_tokenizer.config.hop_length
+-        clip_size = int(ref_wav.shape[-1] % chunk_size)
+-        ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
+-        # numpy → torch at tokenizer boundary
+-        ref_wav_tensor = torch.from_numpy(ref_wav).to(self.audio_tokenizer.device)
+-        ref_audio_tokens = self.audio_tokenizer.encode(
+-            ref_wav_tensor.unsqueeze(0),
+-        ).audio_codes.squeeze(
+-            0
+-        )  # (C, T)
+-
+-        if preprocess_prompt:
+-            ref_text = add_punctuation(ref_text)
+-
+-        return VoiceClonePrompt(
++        return NVVoiceClonePrompt(
+             ref_audio_tokens=ref_audio_tokens,
+             ref_text=ref_text,
+-            ref_rms=ref_rms,
++            nv_audio_tokens=nv_audio_tokens or None,
++            nv_lens=nv_lens or None,
++            nv_positions=nv_positions,
++            ref_rms=None,
+         )
+-
++    
+     def _decode_and_post_process(
+         self,
+         tokens: Union[torch.Tensor, List[torch.Tensor]],
+@@ -728,6 +730,7 @@ class OmniVoice(PreTrainedModel):
+                 self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
+                 .audio_values[0]
+                 .cpu()
++                .detach()
+                 .numpy()
+                 for t in tokens
+             ]
+@@ -737,6 +740,7 @@ class OmniVoice(PreTrainedModel):
+                 self.audio_tokenizer.decode(tokens.to(tokenizer_device).unsqueeze(0))
+                 .audio_values[0]
+                 .cpu()
++                .detach()
+                 .numpy()
+             )
+ 
+@@ -907,8 +911,9 @@ class OmniVoice(PreTrainedModel):
+             list[tuple[torch.Tensor, int]],
+             None,
+         ] = None,
+-        voice_clone_prompt: Union[
+-            VoiceClonePrompt, list[VoiceClonePrompt], None
++        nv_position: Union[tuple, list[tuple], None] = None,
++        nv_voice_clone_prompt: Union[
++                    NVVoiceClonePrompt, list[NVVoiceClonePrompt], None
+         ] = None,
+         instruct: Union[str, list[str], None] = None,
+         preprocess_prompt: bool = True,
+@@ -934,39 +939,62 @@ class OmniVoice(PreTrainedModel):
+             use_zh = bool(text_list[i] and _ZH_RE.search(text_list[i]))
+             instruct_list[i] = _resolve_instruct(s, use_zh=use_zh)
+ 
+-        if voice_clone_prompt is not None and (
++        if nv_voice_clone_prompt is not None and (
+             ref_text is not None or ref_audio is not None
+         ):
+             logger.warning(
+-                "Both voice_clone_prompt and ref_text/ref_audio are provided. "
++                "Both nv_voice_clone_prompt and ref_text/ref_audio are provided. "
+                 "ref_text/ref_audio will be ignored."
+             )
+-        if voice_clone_prompt is None and ref_audio is not None:
+-            # If voice_clone_prompt is not provided, create it from
++        if nv_voice_clone_prompt is None and ref_audio is not None:
++            # If nv_voice_clone_prompt is not provided, create it from
+             # ref_audio (ref_text will be auto-transcribed if not given).
+             ref_text_list = self._ensure_list(ref_text, batch_size, auto_repeat=False)
+             ref_audio_list = self._ensure_list(ref_audio, batch_size, auto_repeat=False)
++            if batch_size == 1 and isinstance(nv_position, list) and (
++                not nv_position
++                or (
++                    isinstance(nv_position[0], (tuple, list))
++                    and len(nv_position[0]) == 2
++                )
++            ):
++                nv_position_list = [nv_position]
++            else:
++                nv_position_list = self._ensure_list(nv_position, batch_size, auto_repeat=False)
+ 
+-            voice_clone_prompt = []
++            nv_voice_clone_prompt = []
+             for i in range(len(ref_text_list)):
+-                voice_clone_prompt.append(
+-                    self.create_voice_clone_prompt(
++                nv_voice_clone_prompt.append(
++                    self.create_nv_voice_clone_prompt(
+                         ref_audio=ref_audio_list[i],
+                         ref_text=ref_text_list[i],
++                        nv_position=nv_position_list[i],
+                         preprocess_prompt=preprocess_prompt,
+                     )
+                 )
+ 
+-        voice_clone_prompt_list = self._ensure_list(voice_clone_prompt, batch_size)
+-        if voice_clone_prompt_list[0] is not None:
+-            ref_text_list = [vc.ref_text for vc in voice_clone_prompt_list]
++        nv_voice_clone_prompt_list = self._ensure_list(nv_voice_clone_prompt, batch_size)
++        if nv_voice_clone_prompt_list[0] is not None:
++            ref_text_list = [vc.ref_text for vc in nv_voice_clone_prompt_list]
+             ref_audio_tokens_list = [
+-                vc.ref_audio_tokens for vc in voice_clone_prompt_list
++                vc.ref_audio_tokens for vc in nv_voice_clone_prompt_list
++            ]
++            nv_audio_tokens_list = [
++            vc.nv_audio_tokens for vc in nv_voice_clone_prompt_list
+             ]
+-            ref_rms_list = [vc.ref_rms for vc in voice_clone_prompt_list]
++            nv_lens_list = [
++            vc.nv_lens for vc in nv_voice_clone_prompt_list
++            ]
++            nv_positions_list = [
++            vc.nv_positions for vc in nv_voice_clone_prompt_list
++            ]
++            ref_rms_list = [vc.ref_rms for vc in nv_voice_clone_prompt_list]
+         else:
+             ref_text_list = [None] * batch_size
+             ref_audio_tokens_list = [None] * batch_size
++            nv_audio_tokens_list = [None] * batch_size
++            nv_lens_list = [None] * batch_size
++            nv_positions_list = [None] * batch_size
+             ref_rms_list = [None] * batch_size
+ 
+         # Normalize speed/duration to per-item lists (may contain None).
+@@ -1028,6 +1056,9 @@ class OmniVoice(PreTrainedModel):
+             instructs=instruct_list,
+             ref_texts=ref_text_list,
+             ref_audio_tokens=ref_audio_tokens_list,
++            nv_audio_tokens=nv_audio_tokens_list,
++            nv_lens=nv_lens_list,
++            nv_positions=nv_positions_list,
+             ref_rms=ref_rms_list,
+             speed=speed_list,
+         )
+@@ -1067,6 +1098,8 @@ class OmniVoice(PreTrainedModel):
+         num_target_tokens: int,
+         ref_text: Optional[str] = None,
+         ref_audio_tokens: Optional[torch.Tensor] = None,
++        nv_audio_tokens: Optional[List[torch.Tensor]] = None,
++        nv_positions: Optional[torch.Tensor] = None,
+         lang: Optional[str] = None,
+         instruct: Optional[str] = None,
+         denoise: bool = True,
+@@ -1119,7 +1152,26 @@ class OmniVoice(PreTrainedModel):
+             dtype=torch.long,
+             device=self.device,
+         )
+-
++        
++        if nv_audio_tokens is not None and nv_positions is not None:
++            if len(nv_audio_tokens) != len(nv_positions):
++                raise ValueError("NV token and position counts do not match")
++            previous_end = 0
++            for tokens, position in zip(nv_audio_tokens, nv_positions):
++                nv_start, nv_end = (int(value.item()) for value in position)
++                if nv_start < previous_end or nv_end <= nv_start:
++                    raise ValueError("NV intervals must be non-overlapping")
++                if nv_start >= num_target_tokens:
++                    logger.warning("Skipping NV interval outside target duration: [%d, %d)", nv_start, nv_end)
++                    continue
++                if nv_end > num_target_tokens:
++                    logger.warning("Clamping NV interval [%d, %d) to target duration %d",
++                                   nv_start, nv_end, num_target_tokens)
++                    nv_end = num_target_tokens
++                    tokens = tokens[..., :nv_end - nv_start]
++                target_audio_tokens[0, :, nv_start:nv_end] = tokens.to(self.device)
++                previous_end = nv_end
++            
+         # Conditional input
+         parts = [style_tokens, text_tokens]
+         if ref_audio_tokens is not None:
+@@ -1132,14 +1184,17 @@ class OmniVoice(PreTrainedModel):
+         if ref_audio_tokens is not None:
+             cond_audio_start_idx -= ref_audio_tokens.size(-1)
+ 
+-        cond_audio_mask = torch.zeros(
+-            1, cond_total_length, dtype=torch.bool, device=self.device
+-        )
++        cond_audio_mask = torch.zeros(1, cond_total_length, dtype=torch.bool, device=self.device)
+         cond_audio_mask[0, cond_audio_start_idx:] = True
++        if nv_audio_tokens is not None and nv_positions is not None:
++            for position in nv_positions:
++                nv_start, nv_end = (int(value.item()) for value in position)
++                cond_audio_mask[0, cond_audio_start_idx + nv_start:cond_audio_start_idx + nv_end] = False
+ 
+         return {
+             "input_ids": cond_input_ids,
+             "audio_mask": cond_audio_mask,
++            "target_audio_tokens": target_audio_tokens,
+         }
+ 
+     def _generate_iterative(
+@@ -1160,28 +1215,13 @@ class OmniVoice(PreTrainedModel):
+         B = task.batch_size
+ 
+         for i in range(B):
+-            logger.debug(
+-                "Item %d — text: %s | ref_text: %s | instruct: %s | lang: %s | target_tokens: %d",
+-                i,
+-                task.texts[i],
+-                task.ref_texts[i],
+-                task.instructs[i],
+-                task.langs[i],
+-                task.target_lens[i],
+-            )
++            logger.debug("Item %d — text: %s | ref_text: %s | instruct: %s | lang: %s | target_tokens: %d",
++                    i, task.texts[i], task.ref_texts[i], task.instructs[i], task.langs[i], task.target_lens[i])
+ 
+-        inputs_list = [
+-            self._prepare_inference_inputs(
+-                task.texts[i],
+-                task.target_lens[i],
+-                task.ref_texts[i],
+-                task.ref_audio_tokens[i],
+-                task.langs[i],
+-                task.instructs[i],
+-                gen_config.denoise,
+-            )
+-            for i in range(B)
+-        ]
++        inputs_list = [self._prepare_inference_inputs(
++                task.texts[i], task.target_lens[i], task.ref_texts[i], task.ref_audio_tokens[i],
++                task.nv_audio_tokens[i], task.nv_positions[i],
++                task.langs[i], task.instructs[i], gen_config.denoise) for i in range(B)]
+ 
+         c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
+         max_c_len = max(c_lens)
+@@ -1222,16 +1262,29 @@ class OmniVoice(PreTrainedModel):
+             dtype=torch.long,
+             device=self.device,
+         )
+-
++        for i in range(B):
++            target_tokens = inputs_list[i]["target_audio_tokens"]
++            t_len = task.target_lens[i]
++            tokens[i, :, :t_len] = target_tokens[0, :, :t_len]
++            
+         timesteps = _get_time_steps(
+             t_start=0.0,
+             t_end=1.0,
+             num_step=gen_config.num_step,
+             t_shift=gen_config.t_shift,
+         ).tolist()
++        scheduling_lens = []
++        for i, t_len in enumerate(task.target_lens):
++            nv_len = 0
++            if task.nv_positions[i] is not None:
++                nv_len = sum(
++                    max(0, min(int(end.item()), t_len) - int(start.item()))
++                    for start, end in task.nv_positions[i]
++                )
++            scheduling_lens.append(t_len - nv_len)
+         schedules = []
+-        for t_len in task.target_lens:
+-            total_mask = t_len * self.config.num_audio_codebook
++        for sched_len in scheduling_lens:
++            total_mask = sched_len * self.config.num_audio_codebook
+             rem = total_mask
+             sched = []
+             for step in range(gen_config.num_step):
