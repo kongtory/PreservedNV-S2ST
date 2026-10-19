@@ -145,7 +145,4 @@ duration can shift the perceived NV location.
 
 ## License and attribution
 
-The helper code and patch are Apache-2.0. The patch is a derivative
-modification of Apache-2.0 OmniVoice; `NOTICE` preserves attribution.
-PretrainedSED is an optional MIT-licensed dependency. Model and dataset terms
-remain the responsibility of their respective upstream providers.
+The original helper code and independently authored modifications are licensed under the MIT License. The OmniVoice patch is derived from Apache-2.0-licensed upstream code and retains the applicable Apache-2.0 license requirements, including copyright notices and attribution in the NOTICE file. PretrainedSED is an optional MIT-licensed dependency. Model and dataset terms remain the responsibility of their respective upstream providers.
